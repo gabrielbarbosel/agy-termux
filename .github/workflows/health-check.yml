@@ -1,0 +1,98 @@
+name: Health Check
+on:
+  schedule:
+    - cron: '0 12 * * *'  # Daily at noon UTC
+  workflow_dispatch:       # Manual trigger
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch latest AGY manifest
+        id: manifest
+        run: |
+          MANIFEST_URL="https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_arm64.json"
+          if ! manifest=$(curl -fsSL "$MANIFEST_URL" 2>/dev/null); then
+            echo "status=manifest_unreachable" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          VERSION=$(echo "$manifest" | jq -r '.version')
+          URL=$(echo "$manifest" | jq -r '.url')
+          SHA512=$(echo "$manifest" | jq -r '.sha512')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "sha512=$SHA512" >> "$GITHUB_OUTPUT"
+          echo "status=ok" >> "$GITHUB_OUTPUT"
+
+      - name: Download binary
+        if: steps.manifest.outputs.status == 'ok'
+        run: |
+          URL="${{ steps.manifest.outputs.url }}"
+          case "$URL" in
+            *.tar.gz*) curl -fsSL -o /tmp/agy.tar.gz "$URL" && tar -xzf /tmp/agy.tar.gz -C /tmp && mv /tmp/antigravity /tmp/agy.official ;;
+            *) curl -fsSL -o /tmp/agy.official "$URL" ;;
+          esac
+          chmod +x /tmp/agy.official
+
+      - name: Run patcher
+        if: steps.manifest.outputs.status == 'ok'
+        id: patch
+        run: |
+          OUTPUT=$( (cd patcher && go run . /tmp/agy.official /tmp/agy.patched) 2>&1) || true
+          echo "$OUTPUT"
+          echo "output<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$OUTPUT" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          if ! echo "$OUTPUT" | grep -q "rewrites"; then
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+          elif echo "$OUTPUT" | grep -q "tcmalloc: 0 rewrites  faccessat2: 0 rewrites"; then
+            echo "result=zero_patches" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=ok" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open issue if something changed
+        if: steps.patch.outputs.result != 'ok' || steps.manifest.outputs.status != 'ok'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ steps.manifest.outputs.status }}';
+            const result = '${{ steps.patch.outputs.result }}';
+            const version = '${{ steps.manifest.outputs.version }}';
+            const output = `${{ steps.patch.outputs.output }}`;
+
+            let title, body, labels;
+
+            if (status === 'manifest_unreachable') {
+              title = '⚠️ Google manifest API unreachable';
+              body = '`agy update` may not work. The manifest URL may have changed.\n\n**Action**: Check if the API endpoint moved.';
+              labels = ['bug'];
+            } else if (result === 'zero_patches') {
+              title = `🎉 v${version} needs zero patches — Android-compatible natively`;
+              body = `AGY v${version} requires no binary patches.\n\nThis means Google fixed all remaining issues (including faccessat2). The patcher still works (exits 0), but this is worth noting.\n\n\`\`\`\n${output}\n\`\`\``;
+              labels = ['enhancement'];
+            } else {
+              title = `🔴 Patch failed on v${version}`;
+              body = `The patcher failed on the latest AGY binary.\n\n\`\`\`\n${output}\n\`\`\`\n\n**Action**: Binary structure may have changed. Update patcher/main.go.`;
+              labels = ['bug', 'critical'];
+            }
+
+            // Don't duplicate — check for existing open issues with same title
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+            if (existing.data.some(i => i.title === title)) return;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels
+            });
